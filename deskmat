@@ -1,0 +1,1903 @@
+#!/usr/bin/env python3
+"""
+deskmat — A Wayland cheat sheet overlay for your desktop.
+
+Fullscreen GTK4 Layer Shell overlay displaying an interactive command reference
+with collapsible sections, live search, and integrated tldr lookups.
+Themed in Monokai Pro colors. Toggle with a keybinding.
+
+Usage:
+    deskmat                     # Launch or toggle (kill existing instance)
+    deskmat --config FILE       # Use custom config file
+    deskmat --version           # Print version
+    deskmat --help              # Show help
+
+Config: ~/.config/deskmat/config.yaml (optional — built-in defaults used if absent)
+"""
+
+__version__ = "1.0.0"
+
+import os
+import sys
+import argparse
+import subprocess
+import re
+import signal
+
+# ── LD_PRELOAD fix for gtk4-layer-shell on Arch ──────────────────────────────
+# Without this, libgtk4-layer-shell loads after libwayland-client and the
+# layer surface initialization silently fails, rendering as a regular window.
+
+_LAYER_SHELL_LIB = "/usr/lib/libgtk4-layer-shell.so"
+if os.path.exists(_LAYER_SHELL_LIB) and _LAYER_SHELL_LIB not in os.environ.get("LD_PRELOAD", ""):
+    os.environ["LD_PRELOAD"] = _LAYER_SHELL_LIB
+    os.execv(sys.executable, [sys.executable] + sys.argv)
+
+import gi
+
+gi.require_version("Gtk", "4.0")
+gi.require_version("Gtk4LayerShell", "1.0")
+from gi.repository import Gtk, Gdk, Gtk4LayerShell, GLib
+
+# ── Constants ─────────────────────────────────────────────────────────────────
+
+LOCKFILE = "/tmp/deskmat.pid"
+CONFIG_DIRS = [
+    os.path.expanduser("~/.config/deskmat"),
+    "/etc/deskmat",
+]
+DEFAULT_CONFIG = "config.yaml"
+
+# ── Monokai Pro palette ───────────────────────────────────────────────────────
+
+MONOKAI_PRO = {
+    "bg": "#2d2a2e",
+    "bg_lighter": "#363337",
+    "bg_card": "#3a373b",
+    "bg_hover": "#433f44",
+    "fg": "#fcfcfa",
+    "fg_dim": "#c1c0c0",
+    "fg_muted": "#939293",
+    "comment": "#727072",
+    "red": "#ff6188",
+    "orange": "#fc9867",
+    "yellow": "#ffd866",
+    "green": "#a9dc76",
+    "cyan": "#78dce8",
+    "purple": "#ab9df2",
+    "border": "#5b595c",
+    "border_dim": "#49474a",
+}
+
+# ── Process management ────────────────────────────────────────────────────────
+
+
+def kill_existing():
+    if os.path.exists(LOCKFILE):
+        try:
+            with open(LOCKFILE, "r") as f:
+                pid = int(f.read().strip())
+            os.kill(pid, signal.SIGTERM)
+            os.remove(LOCKFILE)
+            return True
+        except (ProcessLookupError, ValueError, FileNotFoundError):
+            try:
+                os.remove(LOCKFILE)
+            except FileNotFoundError:
+                pass
+    return False
+
+
+def write_lockfile():
+    with open(LOCKFILE, "w") as f:
+        f.write(str(os.getpid()))
+
+
+def cleanup(*_):
+    try:
+        os.remove(LOCKFILE)
+    except FileNotFoundError:
+        pass
+    sys.exit(0)
+
+
+# ── Config loading ────────────────────────────────────────────────────────────
+
+
+def _find_config(explicit_path=None):
+    """Find config file. Returns path or None."""
+    if explicit_path:
+        if os.path.isfile(explicit_path):
+            return explicit_path
+        print(f"deskmat: config not found: {explicit_path}", file=sys.stderr)
+        sys.exit(1)
+    for d in CONFIG_DIRS:
+        p = os.path.join(d, DEFAULT_CONFIG)
+        if os.path.isfile(p):
+            return p
+    return None
+
+
+def _load_yaml(path):
+    """Load YAML config file. Returns dict or exits on error."""
+    try:
+        import yaml
+    except ImportError:
+        print("deskmat: PyYAML required for config files. Install with: pip install pyyaml", file=sys.stderr)
+        sys.exit(1)
+    try:
+        with open(path, "r") as f:
+            data = yaml.safe_load(f)
+        if not isinstance(data, dict):
+            print(f"deskmat: config must be a YAML mapping: {path}", file=sys.stderr)
+            sys.exit(1)
+        return data
+    except Exception as e:
+        print(f"deskmat: error loading config: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+def _resolve_accent(name, colors):
+    """Resolve accent color name to hex value."""
+    if name.startswith("#"):
+        return name
+    return colors.get(name, colors.get("cyan", "#78dce8"))
+
+
+def _parse_config_column(column_data, colors):
+    """Parse a column from YAML config into the internal data format."""
+    categories = []
+    for cat in column_data:
+        accent = _resolve_accent(cat.get("accent", "cyan"), colors)
+        sections = []
+        for sec in cat.get("sections", []):
+            groups = []
+            for grp in sec.get("groups", []):
+                rows = []
+                for cmd_entry in grp.get("commands", []):
+                    rows.append((
+                        cmd_entry.get("cmd", ""),
+                        cmd_entry.get("desc", ""),
+                        cmd_entry.get("example", ""),
+                    ))
+                groups.append((grp.get("name", ""), rows))
+            sections.append({
+                "title": sec.get("title", "Untitled"),
+                "expanded": sec.get("expanded", False),
+                "groups": groups,
+            })
+        categories.append({
+            "category": cat.get("category", ""),
+            "accent": accent,
+            "sections": sections,
+        })
+    return categories
+
+
+def load_config(explicit_path=None):
+    """Load config and return (colors, left_categories, right_categories, settings)."""
+    colors = dict(MONOKAI_PRO)
+    settings = {
+        "font_family": "MesloLGS NF",
+        "opacity": 0.92,
+        "default_expanded": "Navigation & Files",
+        "cmd_width": 215,
+        "desc_width": 195,
+    }
+
+    config_path = _find_config(explicit_path)
+    if config_path:
+        data = _load_yaml(config_path)
+
+        # Merge color overrides
+        if "colors" in data and isinstance(data["colors"], dict):
+            colors.update(data["colors"])
+
+        # Settings
+        for key in ("font_family", "opacity", "default_expanded", "cmd_width", "desc_width"):
+            if key in data:
+                settings[key] = data[key]
+
+        # Parse columns
+        left = _parse_config_column(data.get("left", []), colors)
+        right = _parse_config_column(data.get("right", []), colors)
+
+        if left or right:
+            return colors, left, right, settings
+
+    # Fall back to built-in defaults
+    return colors, _builtin_left(colors), _builtin_right(colors), settings
+
+
+# ── Built-in default data ────────────────────────────────────────────────────
+# This is the full default cheat sheet, used when no config file is found.
+
+
+def _builtin_left(C):
+    return [
+        {
+            "category": "Linux Core",
+            "accent": C["cyan"],
+            "sections": [
+                {
+                    "title": "Navigation & Files",
+                    "expanded": True,
+                    "groups": [
+                        ("Moving Around", [
+                            ("cd dir", "Enter directory", "cd ~/Projects"),
+                            ("cd .. / cd ~", "Go up / go home", "cd ../../src"),
+                            ("cd -", "Go to previous dir", "cd -"),
+                            ("pwd", "Print working directory", "/home/user/Projects"),
+                            ("pushd / popd", "Dir stack push/pop", "pushd /tmp && popd"),
+                        ]),
+                        ("Listing", [
+                            ("ls", "List files", "ls *.py"),
+                            ("ls -la", "All + details + hidden", "ls -la ~/.config/"),
+                            ("ls -lhS", "Sort by size", "ls -lhS /var/log/"),
+                            ("ls -lt", "Sort by mod time", "ls -lt *.log"),
+                            ("tree -L 2", "Dir tree (2 levels)", "tree -L 2 src/"),
+                        ]),
+                        ("Creating & Copying", [
+                            ("mkdir -p a/b/c", "Create nested dirs", "mkdir -p src/components/ui"),
+                            ("touch file", "Create empty file", "touch .env.local"),
+                            ("cp file dst", "Copy file", "cp config.yml config.bak"),
+                            ("cp -r dir/ dst/", "Copy dir recursively", "cp -r src/ src-backup/"),
+                            ("mv old new", "Move or rename", "mv app.js app.tsx"),
+                        ]),
+                        ("Deleting", [
+                            ("rm file", "Delete file", "rm *.tmp"),
+                            ("rm -rf dir/", "Delete dir recursively", "rm -rf node_modules/"),
+                            ("rmdir dir", "Remove empty dir", "rmdir old-builds/"),
+                        ]),
+                    ],
+                },
+                {
+                    "title": "Reading & Processing",
+                    "expanded": False,
+                    "groups": [
+                        ("Viewing", [
+                            ("cat file", "Print entire file", "cat .env"),
+                            ("bat file", "Pretty syntax highlight", "bat src/main.rs"),
+                            ("less file", "Scroll viewer (q quit)", "less /var/log/syslog"),
+                            ("head -n 30 file", "First 30 lines", "head -n 5 package.json"),
+                            ("tail -n 30 file", "Last 30 lines", "tail -n 100 app.log"),
+                            ("tail -f file", "Live follow (logs)", "tail -f /var/log/nginx/access.log"),
+                        ]),
+                        ("Text Processing", [
+                            ("wc -l file", "Count lines", "wc -l src/**/*.py"),
+                            ("sort file", "Sort alphabetically", "sort names.txt"),
+                            ("sort -n / sort -h", "Sort numeric / human", "du -sh * | sort -h"),
+                            ("uniq / sort | uniq -c", "Dedup / count", "sort access.log | uniq -c | sort -rn"),
+                            ("cut -d',' -f1,3", "Extract CSV cols", "cut -d',' -f1,3 data.csv"),
+                            ("awk '{print $1}'", "Print first field", "awk '{print $9}' access.log"),
+                            ("sed 's/old/new/g'", "Find & replace", "sed -i 's/http/https/g' urls.txt"),
+                            ("tr 'A-Z' 'a-z'", "Transform chars", "echo 'HELLO' | tr 'A-Z' 'a-z'"),
+                        ]),
+                        ("Comparing", [
+                            ("diff file1 file2", "Show differences", "diff old.conf new.conf"),
+                            ("diff -u f1 f2", "Unified diff format", "diff -u main.py feature.py"),
+                            ("vimdiff f1 f2", "Side-by-side vim", "vimdiff .env .env.prod"),
+                        ]),
+                    ],
+                },
+                {
+                    "title": "Search & Find",
+                    "expanded": False,
+                    "groups": [
+                        ("grep", [
+                            ("grep 'text' file", "Search in file", "grep 'error' app.log"),
+                            ("grep -r 'text' .", "Recursive search", "grep -r 'TODO' src/"),
+                            ("grep -i 'text' file", "Case insensitive", "grep -i 'warning' *.log"),
+                            ("grep -n 'text' file", "Show line numbers", "grep -n 'import' main.py"),
+                            ("grep -l 'text' *.py", "Files with matches", "grep -rl 'useState' src/"),
+                            ("grep -v 'text' file", "Lines NOT matching", "grep -v '^#' config.ini"),
+                            ("grep -E 'a|b' file", "Extended regex OR", "grep -E 'err|warn' log.txt"),
+                            ("grep -c 'text' file", "Count matches", "grep -c 'GET' access.log"),
+                        ]),
+                        ("find / fd", [
+                            ("find . -name '*.py'", "Find by name", "find ~/Projects -name '*.env'"),
+                            ("find . -type d", "Directories only", "find . -type d -name __pycache__"),
+                            ("find . -mtime -1", "Modified < 24h", "find . -mtime -7 -name '*.log'"),
+                            ("find . -size +100M", "Files > 100MB", "find / -size +1G 2>/dev/null"),
+                            ("fd pattern", "Fast find", "fd '.py$' src/"),
+                            ("fd -e py 'test'", "Find .py matching", "fd -e tsx component"),
+                        ]),
+                        ("ripgrep", [
+                            ("rg 'pattern'", "Fast recursive search", "rg 'TODO|FIXME' ."),
+                            ("rg -t py 'import'", "Search file type", "rg -t ts 'interface'"),
+                            ("rg -l 'TODO'", "List matching files", "rg -l 'deprecated' src/"),
+                            ("rg -C3 'error'", "3 lines context", "rg -C5 'panic' src/"),
+                            ("which / whereis", "Locate binary", "which python3"),
+                        ]),
+                    ],
+                },
+                {
+                    "title": "Processes & System",
+                    "expanded": False,
+                    "groups": [
+                        ("Process Management", [
+                            ("ps aux", "List all processes", "ps aux --sort=-%mem | head"),
+                            ("ps aux | grep name", "Find process", "ps aux | grep node"),
+                            ("pgrep -f name", "Get PID by name", "pgrep -f 'npm run dev'"),
+                            ("kill PID", "Graceful stop", "kill $(pgrep node)"),
+                            ("kill -9 PID", "Force kill", "kill -9 12345"),
+                            ("pkill -f name", "Kill by pattern", "pkill -f webpack"),
+                            ("htop / btop", "Interactive monitors", "btop"),
+                        ]),
+                        ("System Info", [
+                            ("df -h", "Disk space", "df -h /home"),
+                            ("du -sh dir/", "Directory size", "du -sh ~/.cache/"),
+                            ("du -sh * | sort -h", "Sorted by size", "du -sh /var/log/* | sort -h"),
+                            ("free -h", "RAM usage", "free -h"),
+                            ("uptime", "Uptime & load", "uptime"),
+                            ("uname -a", "Kernel & OS", "uname -r"),
+                            ("lsblk", "Block devices", "lsblk -f"),
+                        ]),
+                        ("Background Jobs", [
+                            ("cmd &", "Run in background", "npm run build &"),
+                            ("jobs", "List bg jobs", "jobs -l"),
+                            ("fg %1 / bg %1", "Foreground / bg", "fg %1"),
+                            ("nohup cmd &", "Survive term close", "nohup ./server.sh &"),
+                            ("disown %1", "Detach from shell", "disown -h %1"),
+                        ]),
+                    ],
+                },
+                {
+                    "title": "Environment & Shell Config",
+                    "expanded": False,
+                    "groups": [
+                        ("Variables", [
+                            ("export VAR=val", "Set env variable", "export NODE_ENV=production"),
+                            ("echo $VAR", "Print variable", "echo $PATH"),
+                            ("env / printenv", "List all env vars", "env | grep -i proxy"),
+                            ("printenv VAR", "Print specific var", "printenv HOME"),
+                            ("unset VAR", "Remove variable", "unset HTTP_PROXY"),
+                            ("VAR=val cmd", "Set for one command", "NODE_ENV=test npm run test"),
+                        ]),
+                        ("PATH & Config", [
+                            ("export PATH=$PATH:dir", "Add to PATH", "export PATH=$PATH:$HOME/.local/bin"),
+                            ("source ~/.zshrc", "Reload shell config", "source ~/.zshrc"),
+                            ("echo $SHELL", "Current shell", "echo $SHELL"),
+                            ("cat /etc/shells", "Available shells", "cat /etc/shells"),
+                            ("chsh -s /bin/zsh", "Change default shell", "chsh -s $(which zsh)"),
+                        ]),
+                        ("Aliases & Functions", [
+                            ("alias name='cmd'", "Create alias", "alias ll='ls -la'"),
+                            ("alias", "List all aliases", "alias | grep git"),
+                            ("unalias name", "Remove alias", "unalias ll"),
+                            ("type cmd", "Check if alias/fn/bin", "type ls"),
+                            ("which -a cmd", "All locations of cmd", "which -a python"),
+                        ]),
+                        ("Dotfiles", [
+                            ("~/.zshrc", "Zsh config (interactive)", "nvim ~/.zshrc"),
+                            ("~/.zprofile", "Zsh login profile", "nvim ~/.zprofile"),
+                            ("~/.config/", "XDG config dir", "ls ~/.config/"),
+                            ("~/.local/bin/", "User scripts", "ls ~/.local/bin/"),
+                            ("~/.ssh/config", "SSH host aliases", "nvim ~/.ssh/config"),
+                        ]),
+                    ],
+                },
+                {
+                    "title": "Archives & Compression",
+                    "expanded": False,
+                    "groups": [
+                        ("tar", [
+                            ("tar czf out.tar.gz dir/", "Compress .tar.gz", "tar czf backup.tar.gz ~/Projects/myapp"),
+                            ("tar xzf file.tar.gz", "Extract .tar.gz", "tar xzf archive.tar.gz -C /tmp/"),
+                            ("tar cjf out.tar.bz2 dir/", "Compress .tar.bz2", "tar cjf logs.tar.bz2 /var/log/"),
+                            ("tar xjf file.tar.bz2", "Extract .tar.bz2", "tar xjf archive.tar.bz2"),
+                            ("tar tf file.tar.gz", "List contents", "tar tf backup.tar.gz | head -20"),
+                            ("tar xzf f.tar.gz -C dir/", "Extract to dir", "tar xzf release.tar.gz -C /opt/"),
+                            ("tar czf - dir/ | ssh h 'cat > f'", "Compress over SSH", "tar czf - src/ | ssh prod 'cat > /tmp/src.tar.gz'"),
+                        ]),
+                        ("zip / gzip / others", [
+                            ("zip -r out.zip dir/", "Create zip", "zip -r deploy.zip dist/ package.json"),
+                            ("unzip file.zip", "Extract zip", "unzip archive.zip -d /tmp/"),
+                            ("unzip -l file.zip", "List zip contents", "unzip -l release.zip"),
+                            ("gzip file", "Compress (replaces)", "gzip access.log"),
+                            ("gunzip file.gz", "Decompress", "gunzip access.log.gz"),
+                            ("zcat file.gz", "Read without extract", "zcat old.log.gz | grep error"),
+                            ("xz / unxz file", "XZ compress/extract", "xz -9 big-dump.sql"),
+                            ("7z a out.7z dir/", "Create 7z archive", "7z a backup.7z ~/Documents/"),
+                        ]),
+                    ],
+                },
+            ],
+        },
+        {
+            "category": "Infrastructure",
+            "accent": C["purple"],
+            "sections": [
+                {
+                    "title": "Network & SSH",
+                    "expanded": False,
+                    "groups": [
+                        ("HTTP & Downloads", [
+                            ("curl url", "Fetch URL", "curl https://api.github.com"),
+                            ("curl -O url", "Download file", "curl -O https://example.com/f.tar.gz"),
+                            ("curl -s cheat.sh/cmd", "Instant cheat sheet", "curl -s cheat.sh/tar"),
+                            ("curl -X POST -d '{}' url", "POST request", "curl -X POST -H 'Content-Type: application/json' -d '{\"a\":1}' url"),
+                            ("wget url", "Download file", "wget https://example.com/file.zip"),
+                        ]),
+                        ("Diagnostics", [
+                            ("ping -c 5 host", "Connectivity check", "ping -c 3 google.com"),
+                            ("traceroute host", "Trace route", "traceroute 8.8.8.8"),
+                            ("dig host", "DNS lookup", "dig +short google.com"),
+                            ("ss -tlnp", "Listening TCP ports", "ss -tlnp | grep 3000"),
+                            ("ip a / ip r", "Interfaces / routes", "ip a show wlan0"),
+                        ]),
+                        ("SSH & Remote", [
+                            ("ssh user@host", "Remote shell", "ssh user@192.168.1.50"),
+                            ("ssh -p 2222 user@host", "Custom port", "ssh -p 2222 deploy@prod"),
+                            ("ssh -L 8080:lo:80 host", "Port forward", "ssh -L 3000:localhost:3000 dev-server"),
+                            ("scp file user@host:path", "Copy to remote", "scp dump.sql admin@db:/tmp/"),
+                            ("rsync -avz src/ host:dst/", "Efficient sync", "rsync -avz ./build/ prod:/var/www/"),
+                            ("ssh-keygen -t ed25519", "Generate key", "ssh-keygen -t ed25519 -C 'me@host'"),
+                            ("ssh-copy-id user@host", "Install key", "ssh-copy-id user@server"),
+                        ]),
+                    ],
+                },
+                {
+                    "title": "Docker & Containers",
+                    "expanded": False,
+                    "groups": [
+                        ("Containers", [
+                            ("docker ps / ps -a", "List containers", "docker ps --format 'table {{.Names}}\\t{{.Status}}'"),
+                            ("docker run -it img bash", "Interactive shell", "docker run -it ubuntu:22.04 bash"),
+                            ("docker run -d -p 80:80 img", "Detached + port", "docker run -d -p 3000:3000 my-app"),
+                            ("docker exec -it ctr bash", "Shell into ctr", "docker exec -it postgres psql -U admin"),
+                            ("docker stop / rm ctr", "Stop / remove", "docker stop my-app && docker rm my-app"),
+                            ("docker logs -f ctr", "Follow logs", "docker logs -f --tail 50 my-app"),
+                        ]),
+                        ("Images & Build", [
+                            ("docker images", "List images", "docker images --format '{{.Repository}}:{{.Tag}}'"),
+                            ("docker build -t name .", "Build image", "docker build -t my-app:latest ."),
+                            ("docker pull / push img", "Download / upload", "docker pull postgres:16-alpine"),
+                            ("docker rmi img", "Remove image", "docker rmi $(docker images -q --filter dangling=true)"),
+                        ]),
+                        ("Compose & Cleanup", [
+                            ("docker compose up -d", "Start stack", "docker compose -f docker-compose.prod.yml up -d"),
+                            ("docker compose down", "Stop stack", "docker compose down -v"),
+                            ("docker compose logs -f", "Follow logs", "docker compose logs -f api db"),
+                            ("docker system prune -a", "Remove ALL unused", "docker system prune -a --volumes"),
+                        ]),
+                    ],
+                },
+                {
+                    "title": "Systemd & Services",
+                    "expanded": False,
+                    "groups": [
+                        ("Service Control", [
+                            ("systemctl status svc", "Check status", "systemctl status nginx"),
+                            ("systemctl start/stop svc", "Start / stop", "systemctl start postgresql"),
+                            ("systemctl restart svc", "Restart", "systemctl restart docker"),
+                            ("systemctl reload svc", "Reload config", "systemctl reload nginx"),
+                            ("systemctl enable --now svc", "Enable + start", "systemctl enable --now sshd"),
+                        ]),
+                        ("Inspecting", [
+                            ("systemctl list-units", "Active units", "systemctl list-units --type=service"),
+                            ("systemctl --failed", "Failed units", "systemctl --failed"),
+                            ("systemctl cat svc", "Show unit file", "systemctl cat nginx"),
+                            ("systemctl daemon-reload", "Reload units", "systemctl daemon-reload"),
+                        ]),
+                        ("Journal Logs", [
+                            ("journalctl -u svc -f", "Follow svc logs", "journalctl -u nginx -f"),
+                            ("journalctl -xe", "Recent errors", "journalctl -xe --no-pager"),
+                            ("journalctl --since today", "Today's logs", "journalctl --since '1 hour ago'"),
+                            ("journalctl -b / -b -1", "Boot logs", "journalctl -b -1 -p err"),
+                        ]),
+                    ],
+                },
+                {
+                    "title": "Packages & Permissions",
+                    "expanded": False,
+                    "groups": [
+                        ("Pacman (Arch)", [
+                            ("pacman -S pkg", "Install", "sudo pacman -S neovim git"),
+                            ("pacman -Syu", "System update", "sudo pacman -Syu"),
+                            ("pacman -Ss name", "Search repos", "pacman -Ss python | head"),
+                            ("pacman -Qi pkg", "Info (installed)", "pacman -Qi linux"),
+                            ("pacman -Rns pkg", "Remove + deps", "sudo pacman -Rns vim"),
+                            ("pacman -Qdt", "Orphan packages", "pacman -Qdt"),
+                            ("yay -S / yay -Sua", "AUR install/update", "yay -S package-name"),
+                        ]),
+                        ("Permissions", [
+                            ("chmod +x file", "Make executable", "chmod +x deploy.sh"),
+                            ("chmod 755 / 600", "rwxr-xr-x / rw----", "chmod 600 ~/.ssh/id_ed25519"),
+                            ("chown user:grp file", "Change owner", "sudo chown -R user:user /opt/app"),
+                            ("sudo command", "Run as root", "sudo systemctl restart nginx"),
+                            ("sudo !!", "Redo as sudo", "sudo !!"),
+                        ]),
+                    ],
+                },
+                {
+                    "title": "Watching & Automation",
+                    "expanded": False,
+                    "groups": [
+                        ("Watching", [
+                            ("watch -n1 'cmd'", "Repeat every 1s", "watch -n2 'docker ps'"),
+                            ("watch -d 'cmd'", "Highlight changes", "watch -d -n5 'df -h'"),
+                            ("watch -n1 -t 'cmd'", "No header", "watch -n1 -t 'kubectl get pods'"),
+                            ("entr", "Run on file change", "ls *.py | entr python main.py"),
+                            ("find . -name '*.rs' | entr cargo test", "Watch + test", "fd -e go | entr go test ./..."),
+                            ("inotifywait -m dir/", "Filesystem events", "inotifywait -m -r ~/Downloads/"),
+                        ]),
+                        ("Systemd Timers", [
+                            ("systemctl list-timers", "List active timers", "systemctl list-timers --all"),
+                            ("systemd-run --on-calendar='*:0/5'", "Run every 5 min", "systemd-run --on-calendar='*:0/30' /usr/local/bin/backup.sh"),
+                            ("systemd-run --on-active=10m cmd", "Run once in 10min", "systemd-run --on-active=1h ~/scripts/cleanup.sh"),
+                            ("~/.config/systemd/user/", "User timer dir", "systemctl --user list-timers"),
+                            ("systemctl --user enable --now t", "Enable user timer", "systemctl --user enable --now backup.timer"),
+                        ]),
+                        ("Scheduling & Repeating", [
+                            ("at now + 5min", "Run once at time", "echo 'notify-send done' | at now + 30min"),
+                            ("timeout 30s cmd", "Kill after timeout", "timeout 10s ping google.com"),
+                            ("while true; do cmd; sleep 5; done", "Simple loop", "while true; do curl -s localhost:3000/health; sleep 5; done"),
+                        ]),
+                    ],
+                },
+                {
+                    "title": "Networking Advanced",
+                    "expanded": False,
+                    "groups": [
+                        ("Firewall (nftables)", [
+                            ("nft list ruleset", "Show all rules", "sudo nft list ruleset"),
+                            ("nft add rule inet filter input tcp dport 80 accept", "Allow port", "sudo nft add rule inet filter input tcp dport 443 accept"),
+                            ("nft list tables", "List tables", "nft list tables"),
+                            ("nft flush ruleset", "Clear all rules", "sudo nft flush ruleset"),
+                        ]),
+                        ("Tunnels & VPN", [
+                            ("cloudflared tunnel run name", "Cloudflare tunnel", "cloudflared tunnel --url http://localhost:3000"),
+                            ("ssh -R 80:lo:3000 host", "Remote port fwd", "ssh -R 8080:localhost:3000 vps"),
+                            ("ssh -D 1080 host", "SOCKS proxy", "ssh -D 1080 -N jumpbox"),
+                            ("wg-quick up wg0", "WireGuard up", "sudo wg-quick up wg0"),
+                            ("wg-quick down wg0", "WireGuard down", "sudo wg-quick down wg0"),
+                            ("wg show", "WireGuard status", "sudo wg show"),
+                        ]),
+                        ("Advanced Tools", [
+                            ("nmap host", "Port scan", "nmap -sV localhost"),
+                            ("nmap -p- host", "All ports scan", "nmap -p- 192.168.1.1"),
+                            ("tcpdump -i any port 80", "Packet capture", "sudo tcpdump -i any port 443 -w capture.pcap"),
+                            ("iftop / nethogs", "Bandwidth monitor", "sudo iftop -i wlan0"),
+                            ("mtr host", "Traceroute + ping", "mtr --report google.com"),
+                        ]),
+                    ],
+                },
+                {
+                    "title": "Disk & Filesystem",
+                    "expanded": False,
+                    "groups": [
+                        ("Mounting", [
+                            ("mount /dev/sdX /mnt", "Mount device", "sudo mount /dev/sdb1 /mnt/usb"),
+                            ("umount /mnt", "Unmount", "sudo umount /mnt/usb"),
+                            ("mount -o loop img /mnt", "Mount ISO/image", "sudo mount -o loop disk.iso /mnt/iso"),
+                            ("sshfs user@host:/ /mnt", "Mount remote via SSH", "sshfs user@server:/home ~/mounts/server"),
+                            ("fusermount -u /mnt", "Unmount FUSE/sshfs", "fusermount -u ~/mounts/server"),
+                        ]),
+                        ("Filesystem Info", [
+                            ("lsblk -f", "Devices + filesystems", "lsblk -f"),
+                            ("blkid", "Block device UUIDs", "sudo blkid"),
+                            ("fdisk -l", "Partition table", "sudo fdisk -l /dev/sda"),
+                            ("df -Th", "Filesystems + types", "df -Th | grep -v tmpfs"),
+                            ("cat /etc/fstab", "Mount config", "cat /etc/fstab"),
+                        ]),
+                        ("Creating & Formatting", [
+                            ("mkfs.ext4 /dev/sdX", "Format as ext4", "sudo mkfs.ext4 /dev/sdb1"),
+                            ("mkfs.btrfs /dev/sdX", "Format as btrfs", "sudo mkfs.btrfs -f /dev/sdb1"),
+                            ("mkfs.fat -F32 /dev/sdX", "Format as FAT32", "sudo mkfs.fat -F32 /dev/sdb1"),
+                            ("parted /dev/sdX", "Partition editor", "sudo parted /dev/sdb print"),
+                            ("dd if=in of=out bs=4M", "Raw disk copy", "sudo dd if=arch.iso of=/dev/sdb bs=4M status=progress"),
+                        ]),
+                        ("Maintenance", [
+                            ("e2fsck -f /dev/sdX", "Check ext4 fs", "sudo e2fsck -f /dev/sda2"),
+                            ("btrfs scrub start /", "Btrfs scrub", "sudo btrfs scrub start /home"),
+                            ("smartctl -a /dev/sdX", "Disk health", "sudo smartctl -a /dev/sda"),
+                            ("hdparm -Tt /dev/sdX", "Disk speed test", "sudo hdparm -Tt /dev/sda"),
+                            ("sync", "Flush write cache", "sync"),
+                        ]),
+                    ],
+                },
+            ],
+        },
+    ]
+
+
+def _builtin_right(C):
+    return [
+        {
+            "category": "Git",
+            "accent": C["orange"],
+            "sections": [
+                {
+                    "title": "Basics & Staging",
+                    "expanded": False,
+                    "groups": [
+                        ("Status & Staging", [
+                            ("git status / -s", "Working tree status", "git status -sb"),
+                            ("git diff / --staged", "Unstaged / staged", "git diff --stat"),
+                            ("git add file / .", "Stage file / all", "git add src/"),
+                            ("git add -p", "Interactive hunks", "git add -p main.py"),
+                            ("git restore file", "Discard changes", "git restore ."),
+                            ("git restore --staged f", "Unstage file", "git restore --staged *.test.js"),
+                        ]),
+                        ("Committing", [
+                            ("git commit -m 'msg'", "Commit", "git commit -m 'fix: resolve auth timeout'"),
+                            ("git commit -am 'msg'", "Stage + commit", "git commit -am 'chore: update deps'"),
+                            ("git commit --amend", "Edit last commit", "git commit --amend --no-edit"),
+                        ]),
+                        ("Setup", [
+                            ("git init / clone url", "New / clone", "git clone --depth 1 git@gh:user/repo"),
+                            ("git remote -v", "List remotes", "git remote add upstream url"),
+                        ]),
+                    ],
+                },
+                {
+                    "title": "Branches & History",
+                    "expanded": False,
+                    "groups": [
+                        ("Branching", [
+                            ("git branch / -a", "List branches", "git branch --sort=-committerdate"),
+                            ("git switch name", "Switch branch", "git switch main"),
+                            ("git switch -c name", "Create + switch", "git switch -c feat/auth-flow"),
+                            ("git branch -d / -D", "Delete branch", "git branch -D old-feature"),
+                        ]),
+                        ("Merging & Rebasing", [
+                            ("git merge branch", "Merge into current", "git merge --no-ff feat/auth"),
+                            ("git rebase main", "Rebase onto main", "git rebase -i HEAD~5"),
+                            ("git cherry-pick SHA", "Apply commit", "git cherry-pick abc123"),
+                        ]),
+                        ("History", [
+                            ("git log --oneline -20", "Compact log", "git log --oneline --graph --all"),
+                            ("git log -p file", "File diff history", "git log -p --follow src/auth.ts"),
+                            ("git show SHA", "Show commit", "git show HEAD~3"),
+                            ("git blame file", "Line-by-line author", "git blame -L 10,20 main.py"),
+                            ("git reflog", "HEAD history", "git reflog --date=relative"),
+                        ]),
+                    ],
+                },
+                {
+                    "title": "Remote & Recovery",
+                    "expanded": False,
+                    "groups": [
+                        ("Remote Sync", [
+                            ("git push / pull", "Push / pull", "git push origin main"),
+                            ("git push -u origin br", "Push + upstream", "git push -u origin feat/new"),
+                            ("git push --force-with-lease", "Safe force push", "git push --force-with-lease origin feat"),
+                            ("git pull --rebase", "Pull + rebase", "git pull --rebase origin main"),
+                            ("git fetch --all --prune", "Fetch + clean", "git fetch --all --prune"),
+                        ]),
+                        ("Stashing", [
+                            ("git stash / -u", "Shelve changes", "git stash -m 'wip: auth flow'"),
+                            ("git stash list", "List stashes", "git stash list"),
+                            ("git stash pop", "Apply + remove", "git stash pop"),
+                            ("git stash apply @{2}", "Apply specific", "git stash apply stash@{0}"),
+                        ]),
+                        ("Undo & Recovery", [
+                            ("git reset --soft HEAD~1", "Undo (keep staged)", "git reset --soft HEAD~1"),
+                            ("git reset --hard HEAD~1", "Undo (lose all)", "git reset --hard origin/main"),
+                            ("git revert SHA", "Undo commit (safe)", "git revert abc123"),
+                            ("git clean -fd", "Remove untracked", "git clean -fxd"),
+                            ("git bisect start", "Binary bug search", "git bisect start HEAD v1.0"),
+                        ]),
+                        ("GitHub CLI", [
+                            ("gh pr create", "Create PR", "gh pr create --fill"),
+                            ("gh pr checkout 123", "Checkout PR", "gh pr checkout 456"),
+                            ("gh pr list / issue list", "List PRs/issues", "gh pr list --state open"),
+                        ]),
+                    ],
+                },
+            ],
+        },
+        {
+            "category": "Dev Tools",
+            "accent": C["green"],
+            "sections": [
+                {
+                    "title": "Node.js & TypeScript",
+                    "expanded": False,
+                    "groups": [
+                        ("npm / npx", [
+                            ("npm init -y", "New package.json", "npm init -y"),
+                            ("npm install / npm i", "Install deps", "npm i express zod"),
+                            ("npm run dev/build/test", "Run scripts", "npm run dev"),
+                            ("npm outdated / update", "Check / update", "npm outdated"),
+                            ("npx create-next-app", "New Next.js app", "npx create-next-app@latest my-app"),
+                            ("npx tsc --noEmit", "Type check", "npx tsc --noEmit --watch"),
+                            ("npx eslint .", "Lint code", "npx eslint . --fix"),
+                        ]),
+                    ],
+                },
+                {
+                    "title": "Python",
+                    "expanded": False,
+                    "groups": [
+                        ("Environment", [
+                            ("python -m venv .venv", "Create venv", "python3 -m venv .venv"),
+                            ("source .venv/bin/activate", "Activate", "source .venv/bin/activate"),
+                            ("pip install -r req.txt", "Install reqs", "pip install -r requirements.txt"),
+                            ("pip freeze > req.txt", "Export reqs", "pip freeze > requirements.txt"),
+                            ("uv pip install pkg", "Fast install", "uv pip install fastapi uvicorn"),
+                        ]),
+                        ("Running & Testing", [
+                            ("python script.py", "Run script", "python -m uvicorn app:main --reload"),
+                            ("python -m pytest", "Run tests", "python -m pytest -x -v --tb=short"),
+                            ("ruff check/format .", "Lint / format", "ruff check . --fix"),
+                            ("mypy .", "Type check", "mypy src/ --strict"),
+                        ]),
+                    ],
+                },
+                {
+                    "title": "Rust, Go & Build Tools",
+                    "expanded": False,
+                    "groups": [
+                        ("Rust", [
+                            ("cargo run / build", "Run / build", "cargo run --release"),
+                            ("cargo check / clippy", "Check / lint", "cargo clippy -- -W warnings"),
+                            ("cargo test", "Run tests", "cargo test -- --nocapture"),
+                            ("cargo add pkg", "Add dep", "cargo add tokio -F full"),
+                        ]),
+                        ("Go", [
+                            ("go run . / build", "Run / build", "go build -o bin/app ."),
+                            ("go test ./...", "Test all", "go test -v -race ./..."),
+                            ("go mod tidy", "Clean go.mod", "go mod tidy"),
+                        ]),
+                        ("General", [
+                            ("make / cmake", "Build", "make -j$(nproc)"),
+                            ("just recipe", "Justfile", "just deploy prod"),
+                        ]),
+                    ],
+                },
+            ],
+        },
+        {
+            "category": "Window Manager",
+            "accent": C["yellow"],
+            "sections": [
+                {
+                    "title": "Windows & Workspaces",
+                    "expanded": False,
+                    "groups": [
+                        ("Focus & Movement", [
+                            ("SUPER + arrows", "Move focus", "SUPER + Left"),
+                            ("SUPER+SHIFT + arrows", "Swap windows", "SUPER+SHIFT + Right"),
+                            ("SUPER+CTRL + arrows", "Resize (40px)", "SUPER+CTRL + Up"),
+                            ("SUPER + LMB drag", "Move window", "hold SUPER, drag window"),
+                            ("SUPER + RMB drag", "Resize window", "hold SUPER, right-drag edge"),
+                        ]),
+                        ("Layout", [
+                            ("SUPER + V", "Toggle floating", ""),
+                            ("SUPER + P", "Pseudotile", ""),
+                            ("SUPER + J", "Toggle split dir", ""),
+                            ("SUPER + C", "Close window", ""),
+                        ]),
+                        ("Workspaces", [
+                            ("SUPER + 1-0", "Switch ws 1-10", "SUPER + 4"),
+                            ("SUPER+SHIFT + 1-0", "Move win to ws", "SUPER+SHIFT + 7"),
+                            ("SUPER + scroll", "Cycle workspaces", "scroll on empty area"),
+                        ]),
+                    ],
+                },
+                {
+                    "title": "Apps & Launchers",
+                    "expanded": False,
+                    "groups": [
+                        ("Launch Apps", [
+                            ("SUPER + Q", "Terminal", ""),
+                            ("SUPER + R", "App launcher", ""),
+                            ("SUPER + E", "File manager", ""),
+                        ]),
+                        ("Screenshots", [
+                            ("Print", "Area select", "grimblast + swappy"),
+                            ("SHIFT + Print", "Active window", ""),
+                            ("CTRL + Print", "Full output", ""),
+                        ]),
+                    ],
+                },
+                {
+                    "title": "System & Media",
+                    "expanded": False,
+                    "groups": [
+                        ("System", [
+                            ("SUPER + L", "Lock screen", ""),
+                            ("SUPER + M", "Logout", ""),
+                        ]),
+                        ("Media & HW", [
+                            ("Vol keys", "Volume ctl", "wpctl, 5% steps"),
+                            ("Brightness keys", "Laptop backlight", "brightnessctl"),
+                            ("Media keys", "Player control", "playerctl next/prev/play"),
+                        ]),
+                    ],
+                },
+            ],
+        },
+        {
+            "category": "Recipes & Combos",
+            "accent": C["cyan"],
+            "sections": [
+                {
+                    "title": "File & Directory Stats",
+                    "expanded": False,
+                    "groups": [
+                        ("Counting", [
+                            ("ls | wc -l", "Count items in dir", "ls ~/Downloads | wc -l"),
+                            ("ls -1 dir/ | wc -l", "Count in specific dir", "ls -1 /var/log/ | wc -l"),
+                            ("find . -type f | wc -l", "Count files recursively", "find src/ -type f | wc -l"),
+                            ("find . -maxdepth 1 -type f | wc -l", "Count files (not dirs)", "find . -maxdepth 1 -type f | wc -l"),
+                            ("find . -name '*.py' | wc -l", "Count by extension", "find . -name '*.ts' | wc -l"),
+                            ("wc -l **/*.py", "Lines of code by file", "wc -l src/**/*.ts | tail -1"),
+                        ]),
+                        ("Sizes & Space", [
+                            ("du -sh * | sort -h", "Biggest items in dir", "du -sh ~/Projects/* | sort -h"),
+                            ("du -sh * | sort -h | tail -5", "Top 5 biggest", "du -sh /var/log/* | sort -h | tail -5"),
+                            ("find . -size +100M", "Files over 100MB", "find ~ -size +500M 2>/dev/null"),
+                            ("find . -type f -exec du -h {} + | sort -h | tail -20", "20 largest files", ""),
+                            ("df -h | grep -v tmpfs", "Real disk usage", "df -h /home"),
+                            ("ncdu dir/", "Interactive disk usage", "ncdu ~/"),
+                        ]),
+                    ],
+                },
+                {
+                    "title": "Common Pipe Chains",
+                    "expanded": False,
+                    "groups": [
+                        ("Find & Act", [
+                            ("find . -name '*.log' -delete", "Delete by pattern", "find /tmp -name '*.tmp' -mtime +7 -delete"),
+                            ("find . -name '*.py' -exec grep 'TODO' {} +", "Search in found files", "find src/ -name '*.ts' -exec grep -l 'deprecated' {} +"),
+                            ("find . -type f | xargs grep 'text'", "xargs pattern", "find . -name '*.md' | xargs grep 'TODO'"),
+                            ("grep -rl 'old' . | xargs sed -i 's/old/new/g'", "Bulk find & replace", "grep -rl 'http://' src/ | xargs sed -i 's|http://|https://|g'"),
+                        ]),
+                        ("Process & Port", [
+                            ("lsof -i :PORT", "What's on port", "lsof -i :3000"),
+                            ("ss -tlnp | grep PORT", "Find port listener", "ss -tlnp | grep 8080"),
+                            ("kill $(lsof -t -i :PORT)", "Kill by port", "kill $(lsof -t -i :3000)"),
+                            ("ps aux --sort=-%mem | head", "Top memory hogs", "ps aux --sort=-%mem | head -10"),
+                            ("ps aux --sort=-%cpu | head", "Top CPU hogs", "ps aux --sort=-%cpu | head -10"),
+                            ("watch -n1 'cmd'", "Repeat cmd every 1s", "watch -n2 'docker ps'"),
+                        ]),
+                        ("Text & Data", [
+                            ("cat file | sort | uniq -c | sort -rn", "Frequency count", "cat access.log | awk '{print $1}' | sort | uniq -c | sort -rn | head"),
+                            ("comm -23 <(sort a) <(sort b)", "Lines in a not in b", "comm -23 <(sort old.txt) <(sort new.txt)"),
+                            ("paste -sd+ file | bc", "Sum numbers in file", "seq 1 100 | paste -sd+ | bc"),
+                            ("column -t -s',' file.csv", "Pretty print CSV", "column -t -s',' data.csv | head"),
+                            ("jq '.' file.json", "Pretty print JSON", "curl -s api.github.com | jq '.current_user_url'"),
+                        ]),
+                    ],
+                },
+            ],
+        },
+        {
+            "category": "Shell Power",
+            "accent": C["red"],
+            "sections": [
+                {
+                    "title": "Pipes, Redirection & Tricks",
+                    "expanded": False,
+                    "groups": [
+                        ("Piping & Redirection", [
+                            ("cmd1 | cmd2", "Pipe stdout", "cat log | grep error | wc -l"),
+                            ("cmd > / >> file", "Overwrite / append", "echo 'line' >> notes.txt"),
+                            ("cmd 2>&1", "Merge stderr", "make 2>&1 | tee build.log"),
+                            ("cmd 2>/dev/null", "Discard errors", "find / -name '*.conf' 2>/dev/null"),
+                            ("cmd1 && cmd2", "If success then", "npm test && npm run build"),
+                            ("cmd1 || cmd2", "If fails then", "ping -c1 host || echo 'down'"),
+                        ]),
+                        ("Substitution", [
+                            ("$(cmd)", "Cmd substitution", 'echo "Today is $(date +%F)"'),
+                            ("${var:-default}", "Default value", "echo ${PORT:-3000}"),
+                            ("{a,b,c}.txt", "Brace expansion", "cp config.{yml,yml.bak}"),
+                            ("*.py / **/*.py", "Glob / recursive", "ls **/*.test.ts"),
+                            ("!! / !$", "Last cmd / last arg", "sudo !!"),
+                        ]),
+                        ("Keyboard Shortcuts", [
+                            ("Ctrl+R", "Reverse search", "type to search history"),
+                            ("Ctrl+A / Ctrl+E", "Start / end of line", ""),
+                            ("Ctrl+W", "Delete word back", ""),
+                            ("Ctrl+U / Ctrl+K", "Del to start / end", ""),
+                            ("Ctrl+C / Ctrl+Z", "Kill / suspend", "Ctrl+Z then bg"),
+                            ("Ctrl+D", "Exit / EOF", ""),
+                        ]),
+                        ("Getting Help", [
+                            ("tldr CMD", "Offline cheat sheet", "tldr tar"),
+                            ("curl cheat.sh/CMD", "Online examples", "curl -s cheat.sh/rsync"),
+                            ("man CMD", "Full manual", "man 5 ssh_config"),
+                            ("CMD --help", "Built-in help", "git --help"),
+                        ]),
+                    ],
+                },
+            ],
+        },
+    ]
+
+
+# ── tldr helper ───────────────────────────────────────────────────────────────
+
+
+def _extract_base_cmd(cmd_text):
+    """Extract the base command name from a cheat sheet command string."""
+    text = cmd_text.strip()
+    if " / " in text:
+        text = text.split(" / ")[0].strip()
+    if " | " in text:
+        text = text.split(" | ")[0].strip()
+    parts = text.split()
+    idx = 0
+    for p in parts:
+        if "=" in p and not p.startswith("-"):
+            idx += 1
+        else:
+            break
+    parts = parts[idx:]
+    if not parts:
+        return None
+    base = parts[0]
+    skip = {"sudo", "nohup", "timeout", "watch", "env"}
+    while base in skip and len(parts) > 1:
+        parts = parts[1:]
+        base = parts[0]
+    base = base.rstrip(".,;:!?")
+    if base.startswith("~") or base.startswith("/") or base.startswith("$"):
+        return None
+    if not base or len(base) > 30:
+        return None
+    return base
+
+
+def _run_tldr(cmd_name):
+    """Run tldr and return (success, output_text)."""
+    try:
+        result = subprocess.run(
+            ["tldr", "--raw", cmd_name],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return True, result.stdout.strip()
+        return False, f"No tldr page found for '{cmd_name}'"
+    except FileNotFoundError:
+        return False, "tldr not installed (try: pacman -S tealdeer)"
+    except subprocess.TimeoutExpired:
+        return False, "tldr timed out"
+
+
+def _parse_tldr_raw(raw_text):
+    """Parse raw tldr markdown into structured data."""
+    lines = raw_text.split("\n")
+    title = ""
+    desc_lines = []
+    entries = []
+    current_explanation = ""
+
+    for line in lines:
+        if line.startswith("# "):
+            title = line[2:].strip()
+        elif line.startswith("> "):
+            desc_lines.append(line[2:].strip())
+        elif line.startswith("- "):
+            current_explanation = line[2:].strip()
+        elif line.startswith("`") and line.endswith("`"):
+            code = line[1:-1]
+            code = re.sub(r'\{\{([^}]*)\}\}', r'\1', code)
+            entries.append((current_explanation, code))
+            current_explanation = ""
+
+    desc = " ".join(desc_lines)
+    desc = re.sub(r'\s*More information:.*$', '', desc)
+    return title, desc, entries
+
+
+# ── CSS ───────────────────────────────────────────────────────────────────────
+
+
+def build_css(C, settings):
+    font = settings["font_family"]
+    opacity = settings["opacity"]
+    return f"""
+window {{
+    background-color: alpha({C['bg']}, {opacity});
+}}
+
+.overlay-scroll {{
+    background: transparent;
+}}
+
+.main-container {{
+    padding: 20px 32px 16px 32px;
+}}
+
+.header-box {{
+    margin-bottom: 12px;
+}}
+
+.title-label {{
+    color: {C['yellow']};
+    font-size: 18px;
+    font-weight: 800;
+    font-family: "{font}", monospace;
+    letter-spacing: 4px;
+}}
+
+.title-sep {{
+    color: {C['border']};
+    font-size: 18px;
+    font-weight: 300;
+    font-family: "{font}", monospace;
+    margin-left: 12px;
+    margin-right: 12px;
+}}
+
+.title-accent {{
+    color: {C['cyan']};
+    font-size: 12px;
+    font-weight: 600;
+    font-family: "{font}", monospace;
+    letter-spacing: 2px;
+}}
+
+.subtitle-label {{
+    color: {C['fg_muted']};
+    font-size: 10px;
+    font-family: "{font}", monospace;
+    letter-spacing: 2px;
+    margin-top: 2px;
+}}
+
+.columns-box {{
+    margin-top: 4px;
+}}
+
+.column-gap {{
+    min-width: 16px;
+}}
+
+.category-bar {{
+    margin-top: 8px;
+    margin-bottom: 5px;
+    padding: 0 4px;
+}}
+
+.category-bar-first {{
+    margin-top: 0;
+}}
+
+.category-label {{
+    font-size: 10px;
+    font-weight: 800;
+    font-family: "{font}", monospace;
+    letter-spacing: 3px;
+}}
+
+.category-line {{
+    min-height: 1px;
+    margin-left: 10px;
+    opacity: 0.3;
+}}
+
+.section-row {{
+    background-color: alpha({C['bg_card']}, 0.5);
+    border-radius: 6px;
+    border: 1px solid alpha({C['border_dim']}, 0.25);
+    margin-bottom: 4px;
+    transition: all 100ms ease-in-out;
+}}
+
+.section-row:hover {{
+    background-color: alpha({C['bg_hover']}, 0.7);
+}}
+
+.section-title-bar {{
+    padding: 8px 12px;
+}}
+
+.section-indicator {{
+    font-size: 9px;
+    color: {C['comment']};
+    font-family: "{font}", monospace;
+    min-width: 12px;
+}}
+
+.section-title {{
+    font-size: 11px;
+    font-weight: 700;
+    font-family: "{font}", monospace;
+    letter-spacing: 1.5px;
+    margin-left: 6px;
+}}
+
+.section-count {{
+    color: {C['fg_muted']};
+    font-size: 9px;
+    font-family: "{font}", monospace;
+}}
+
+.section-content {{
+    padding: 0 12px 8px 12px;
+}}
+
+.accent-bar {{
+    min-height: 2px;
+    border-radius: 1px;
+    margin-bottom: 6px;
+    opacity: 0.4;
+}}
+
+.subgroup-header {{
+    color: {C['fg_dim']};
+    font-size: 9px;
+    font-weight: 700;
+    font-family: "{font}", monospace;
+    letter-spacing: 1px;
+    margin-top: 5px;
+    margin-bottom: 2px;
+    padding-left: 2px;
+}}
+
+.subgroup-sep {{
+    background-color: alpha({C['border_dim']}, 0.15);
+    min-height: 1px;
+    margin-top: 4px;
+    margin-bottom: 2px;
+}}
+
+.cmd-row {{
+    margin-top: 1px;
+    margin-bottom: 1px;
+    padding: 1px 4px;
+    border-radius: 3px;
+}}
+
+.cmd-row:hover {{
+    background-color: alpha({C['bg_lighter']}, 0.5);
+}}
+
+.cmd-label {{
+    color: {C['green']};
+    font-size: 11px;
+    font-family: "{font}", monospace;
+    font-weight: 600;
+}}
+
+.cmd-clickable:hover {{
+    color: {C['yellow']};
+}}
+
+.desc-label {{
+    color: {C['fg']};
+    font-size: 10px;
+    font-family: "{font}", monospace;
+}}
+
+.example-label {{
+    color: {C['fg_muted']};
+    font-size: 10px;
+    font-family: "{font}", monospace;
+    font-style: italic;
+}}
+
+.footer-box {{
+    margin-top: 8px;
+    padding-top: 6px;
+    border-top: 1px solid alpha({C['border']}, 0.2);
+}}
+
+.footer-hint {{
+    color: {C['fg_muted']};
+    font-size: 10px;
+    font-family: "{font}", monospace;
+    letter-spacing: 2px;
+}}
+
+.footer-key {{
+    color: {C['cyan']};
+    font-size: 10px;
+    font-weight: 600;
+    font-family: "{font}", monospace;
+}}
+
+.footer-keys {{
+    color: {C['fg_dim']};
+    font-size: 10px;
+    font-family: "{font}", monospace;
+}}
+
+.footer-sep {{
+    color: {C['border']};
+    font-size: 10px;
+    font-family: "{font}", monospace;
+    margin-left: 6px;
+    margin-right: 6px;
+}}
+
+.search-box {{
+    margin-bottom: 8px;
+}}
+
+.search-entry {{
+    background-color: alpha({C['bg_card']}, 0.8);
+    color: {C['fg']};
+    border: 1px solid alpha({C['border']}, 0.4);
+    border-radius: 6px;
+    padding: 6px 12px;
+    font-size: 12px;
+    font-family: "{font}", monospace;
+    min-width: 400px;
+    caret-color: {C['yellow']};
+}}
+
+.search-entry:focus {{
+    border-color: alpha({C['cyan']}, 0.6);
+    background-color: alpha({C['bg_card']}, 0.95);
+}}
+
+.search-entry placeholder {{
+    color: {C['comment']};
+    font-style: italic;
+}}
+
+.search-hint {{
+    color: {C['fg_muted']};
+    font-size: 9px;
+    font-family: "{font}", monospace;
+    margin-left: 10px;
+}}
+
+.search-results-box {{
+    background-color: alpha({C['bg_card']}, 0.95);
+    border: 1px solid alpha({C['border']}, 0.3);
+    border-radius: 6px;
+    padding: 12px 16px;
+    margin-bottom: 8px;
+}}
+
+.tldr-overlay {{
+    background-color: alpha({C['bg']}, 0.97);
+}}
+
+.tldr-popup {{
+    background-color: {C['bg_card']};
+    border: 1px solid alpha({C['cyan']}, 0.4);
+    border-radius: 8px;
+    padding: 16px 20px;
+    min-width: 500px;
+}}
+
+.tldr-title {{
+    color: {C['cyan']};
+    font-size: 14px;
+    font-weight: 800;
+    font-family: "{font}", monospace;
+    letter-spacing: 2px;
+}}
+
+.tldr-desc {{
+    color: {C['fg_dim']};
+    font-size: 10px;
+    font-family: "{font}", monospace;
+    margin-top: 4px;
+    margin-bottom: 10px;
+}}
+
+.tldr-explanation {{
+    color: {C['fg']};
+    font-size: 10px;
+    font-family: "{font}", monospace;
+    margin-top: 6px;
+}}
+
+.tldr-code {{
+    color: {C['green']};
+    font-size: 11px;
+    font-family: "{font}", monospace;
+    font-weight: 600;
+    background-color: alpha({C['bg']}, 0.6);
+    padding: 4px 8px;
+    border-radius: 4px;
+    margin-top: 2px;
+}}
+
+.tldr-sep {{
+    background-color: alpha({C['border_dim']}, 0.3);
+    min-height: 1px;
+    margin-top: 8px;
+}}
+
+.tldr-close-hint {{
+    color: {C['comment']};
+    font-size: 9px;
+    font-family: "{font}", monospace;
+    margin-top: 10px;
+}}
+
+.tldr-error {{
+    color: {C['fg_muted']};
+    font-size: 10px;
+    font-family: "{font}", monospace;
+    font-style: italic;
+}}
+
+.tldr-source {{
+    color: {C['comment']};
+    font-size: 9px;
+    font-family: "{font}", monospace;
+    margin-top: 8px;
+    font-style: italic;
+}}
+"""
+
+
+# ── Application ───────────────────────────────────────────────────────────────
+
+
+class DeskmatApp(Gtk.Application):
+    def __init__(self, colors, left_cats, right_cats, settings):
+        super().__init__(application_id="dev.deskmat.overlay")
+        self.C = colors
+        self.left_cats = left_cats
+        self.right_cats = right_cats
+        self.settings = settings
+        self._css_providers = []
+        self._sections = []  # (revealer, indicator, count_label, total_cmds)
+        self._cmd_rows = []  # (row_widget, cmd_lower, desc_lower, example_lower, section_idx)
+        self._tldr_overlay = None
+        self._search_entry = None
+        self._search_results_rev = None
+        self._search_results_box = None
+        self._tldr_cache = {}
+        self._focus_sink = None
+        self._overlay_parent = None
+
+    def _add_css(self, css_str):
+        p = Gtk.CssProvider()
+        p.load_from_string(css_str)
+        Gtk.StyleContext.add_provider_for_display(
+            Gdk.Display.get_default(), p,
+            Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION + 1,
+        )
+        self._css_providers.append(p)
+
+    def do_activate(self):
+        win = Gtk.ApplicationWindow(application=self)
+
+        Gtk4LayerShell.init_for_window(win)
+        Gtk4LayerShell.set_layer(win, Gtk4LayerShell.Layer.OVERLAY)
+        Gtk4LayerShell.set_keyboard_mode(win, Gtk4LayerShell.KeyboardMode.EXCLUSIVE)
+        for edge in (Gtk4LayerShell.Edge.TOP, Gtk4LayerShell.Edge.BOTTOM,
+                     Gtk4LayerShell.Edge.LEFT, Gtk4LayerShell.Edge.RIGHT):
+            Gtk4LayerShell.set_anchor(win, edge, True)
+
+        provider = Gtk.CssProvider()
+        provider.load_from_string(build_css(self.C, self.settings))
+        Gtk.StyleContext.add_provider_for_display(
+            Gdk.Display.get_default(), provider,
+            Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION,
+        )
+        self._css_providers.append(provider)
+
+        # ESC in capture phase — before Entry can swallow it
+        esc_ctl = Gtk.EventControllerKey()
+        esc_ctl.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+        esc_ctl.connect("key-pressed", self._on_key_capture)
+        win.add_controller(esc_ctl)
+
+        # Other keys in bubble phase — so Entry gets them first
+        key_ctl = Gtk.EventControllerKey()
+        key_ctl.connect("key-pressed", self._on_key)
+        win.add_controller(key_ctl)
+
+        scroll = Gtk.ScrolledWindow()
+        scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        scroll.add_css_class("overlay-scroll")
+
+        main = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        main.add_css_class("main-container")
+        main.set_hexpand(True)
+
+        # Header
+        header = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        header.add_css_class("header-box")
+        header.set_halign(Gtk.Align.CENTER)
+
+        title_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
+        title_row.set_halign(Gtk.Align.CENTER)
+        t1 = Gtk.Label(label="DESKMAT")
+        t1.add_css_class("title-label")
+        title_row.append(t1)
+        sep = Gtk.Label(label="|")
+        sep.add_css_class("title-sep")
+        title_row.append(sep)
+        t2 = Gtk.Label(label="COMMAND CHEAT SHEET")
+        t2.add_css_class("title-accent")
+        t2.set_valign(Gtk.Align.CENTER)
+        title_row.append(t2)
+        header.append(title_row)
+
+        sub = Gtk.Label(
+            label="CLICK SECTION TO EXPAND  //  CLICK CMD FOR TLDR  //  ESC = CLOSE"
+        )
+        sub.add_css_class("subtitle-label")
+        sub.set_halign(Gtk.Align.CENTER)
+        header.append(sub)
+        main.append(header)
+
+        # Search bar
+        search_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
+        search_box.add_css_class("search-box")
+        search_box.set_halign(Gtk.Align.CENTER)
+
+        self._search_entry = Gtk.Entry()
+        self._search_entry.set_placeholder_text("Search commands or type any command for tldr...")
+        self._search_entry.add_css_class("search-entry")
+        self._search_entry.connect("changed", self._on_search_changed)
+        self._search_entry.connect("activate", self._on_search_activate)
+        search_box.append(self._search_entry)
+
+        search_hint = Gtk.Label(label="ENTER = tldr lookup  //  type to filter")
+        search_hint.add_css_class("search-hint")
+        search_box.append(search_hint)
+        main.append(search_box)
+
+        # Search results area (hidden by default)
+        self._search_results_rev = Gtk.Revealer()
+        self._search_results_rev.set_transition_type(Gtk.RevealerTransitionType.SLIDE_DOWN)
+        self._search_results_rev.set_transition_duration(150)
+        self._search_results_rev.set_reveal_child(False)
+        self._search_results_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        self._search_results_box.add_css_class("search-results-box")
+        self._search_results_rev.set_child(self._search_results_box)
+        main.append(self._search_results_rev)
+
+        # Two columns
+        columns = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
+        columns.add_css_class("columns-box")
+        columns.set_hexpand(True)
+
+        left_col = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        left_col.set_hexpand(True)
+        right_col = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        right_col.set_hexpand(True)
+        gap = Gtk.Box()
+        gap.add_css_class("column-gap")
+
+        self._build_column(left_col, self.left_cats)
+        self._build_column(right_col, self.right_cats)
+
+        columns.append(left_col)
+        columns.append(gap)
+        columns.append(right_col)
+        main.append(columns)
+
+        # Footer
+        footer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=3)
+        footer.add_css_class("footer-box")
+        footer.set_halign(Gtk.Align.CENTER)
+
+        keys_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
+        keys_row.set_halign(Gtk.Align.CENTER)
+        for i, (k, d) in enumerate([
+            ("ESC", "close"), ("E", "expand all"), ("C", "collapse all"),
+            ("/", "search"), ("ENTER", "tldr lookup"),
+        ]):
+            if i > 0:
+                sp = Gtk.Label(label="|")
+                sp.add_css_class("footer-sep")
+                keys_row.append(sp)
+            kl = Gtk.Label(label=k)
+            kl.add_css_class("footer-key")
+            keys_row.append(kl)
+            dl = Gtk.Label(label=f" {d}")
+            dl.add_css_class("footer-keys")
+            keys_row.append(dl)
+        footer.append(keys_row)
+
+        tip = Gtk.Label(label="click any command for its tldr page  //  search + ENTER for any command")
+        tip.add_css_class("footer-hint")
+        footer.append(tip)
+        main.append(footer)
+
+        # Hidden focus sink
+        self._focus_sink = Gtk.Button(label="")
+        self._focus_sink.set_can_focus(True)
+        self._focus_sink.set_focusable(True)
+        self._focus_sink.set_opacity(0)
+        self._focus_sink.set_size_request(0, 0)
+        main.append(self._focus_sink)
+
+        # Click anywhere unfocuses search
+        scroll_click = Gtk.GestureClick()
+        scroll_click.connect("pressed", self._on_bg_click)
+        scroll.add_controller(scroll_click)
+
+        scroll.set_child(main)
+
+        # Overlay for tldr popup
+        overlay = Gtk.Overlay()
+        overlay.set_child(scroll)
+        self._overlay_parent = overlay
+
+        win.set_child(overlay)
+        win.present()
+        self._focus_sink.grab_focus()
+
+    # ── Build UI ──────────────────────────────────────────────────────────────
+
+    def _build_column(self, col, categories):
+        for ci, cat in enumerate(categories):
+            col.append(self._build_cat_header(cat, first=(ci == 0)))
+            for sec in cat["sections"]:
+                gidx = len(self._sections)
+                col.append(self._build_section(gidx, sec, cat["accent"]))
+
+    def _build_cat_header(self, cat, first=False):
+        accent = cat["accent"]
+        bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
+        bar.add_css_class("category-bar")
+        if first:
+            bar.add_css_class("category-bar-first")
+        bar.set_hexpand(True)
+
+        label = Gtk.Label(label=cat["category"].upper())
+        label.add_css_class("category-label")
+        cls = f"cc-{id(cat):x}"
+        self._add_css(f".{cls} {{ color: {accent}; }}")
+        label.add_css_class(cls)
+        bar.append(label)
+
+        line = Gtk.Box()
+        line.add_css_class("category-line")
+        line.set_hexpand(True)
+        lcls = f"cl-{id(cat):x}"
+        self._add_css(f".{lcls} {{ background-color: {accent}; }}")
+        line.add_css_class(lcls)
+        bar.append(line)
+        return bar
+
+    def _build_section(self, gidx, sec, accent):
+        total = sum(len(g[1]) for g in sec["groups"])
+        expanded = sec["expanded"]
+
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        box.add_css_class("section-row")
+
+        tbar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
+        tbar.add_css_class("section-title-bar")
+
+        ind = Gtk.Label(label="▼" if expanded else "▶")
+        ind.add_css_class("section-indicator")
+        tbar.append(ind)
+
+        title = Gtk.Label(label=sec["title"].upper())
+        title.add_css_class("section-title")
+        title.set_halign(Gtk.Align.START)
+        title.set_hexpand(True)
+        cls = f"st-{id(sec):x}"
+        self._add_css(f".{cls} {{ color: {accent}; }}")
+        title.add_css_class(cls)
+        tbar.append(title)
+
+        cnt = Gtk.Label(label=f"{total} cmds")
+        cnt.add_css_class("section-count")
+        tbar.append(cnt)
+
+        click = Gtk.GestureClick()
+        click.connect("pressed", self._on_toggle, gidx)
+        tbar.add_controller(click)
+        box.append(tbar)
+
+        rev = Gtk.Revealer()
+        rev.set_transition_type(Gtk.RevealerTransitionType.SLIDE_DOWN)
+        rev.set_transition_duration(150)
+        rev.set_reveal_child(expanded)
+
+        content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        content.add_css_class("section-content")
+
+        bar = Gtk.Box()
+        bar.add_css_class("accent-bar")
+        bcls = f"ab-{id(sec):x}"
+        self._add_css(f".{bcls} {{ background-color: {accent}; }}")
+        bar.add_css_class(bcls)
+        content.append(bar)
+
+        cmd_w = self.settings["cmd_width"]
+        desc_w = self.settings["desc_width"]
+
+        for gi, (gname, rows) in enumerate(sec["groups"]):
+            if gi > 0:
+                s = Gtk.Box()
+                s.add_css_class("subgroup-sep")
+                content.append(s)
+            if gname:
+                gh = Gtk.Label(label=gname.upper())
+                gh.add_css_class("subgroup-header")
+                gh.set_halign(Gtk.Align.START)
+                content.append(gh)
+            for cmd, desc, example in rows:
+                row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+                row.add_css_class("cmd-row")
+
+                cl = Gtk.Label(label=cmd)
+                cl.add_css_class("cmd-label")
+                cl.add_css_class("cmd-clickable")
+                cl.set_halign(Gtk.Align.START)
+                cl.set_xalign(0)
+                cl.set_hexpand(False)
+                cl.set_size_request(cmd_w, -1)
+
+                cmd_click = Gtk.GestureClick()
+                cmd_click.connect("pressed", self._on_cmd_click, cmd)
+                cl.add_controller(cmd_click)
+
+                dl = Gtk.Label(label=desc)
+                dl.add_css_class("desc-label")
+                dl.set_halign(Gtk.Align.START)
+                dl.set_xalign(0)
+                dl.set_hexpand(False)
+                dl.set_size_request(desc_w, -1)
+
+                row.append(cl)
+                row.append(dl)
+
+                if example:
+                    el = Gtk.Label(label=example)
+                    el.add_css_class("example-label")
+                    el.set_halign(Gtk.Align.START)
+                    el.set_hexpand(True)
+                    el.set_xalign(0)
+                    el.set_ellipsize(3)
+                    row.append(el)
+
+                content.append(row)
+                self._cmd_rows.append((row, cmd.lower(), desc.lower(), example.lower(), gidx))
+
+        rev.set_child(content)
+        box.append(rev)
+        self._sections.append((rev, ind, cnt, total))
+        return box
+
+    # ── Events ────────────────────────────────────────────────────────────────
+
+    def _on_bg_click(self, gesture, n_press, x, y):
+        if self._is_search_focused():
+            self._focus_sink.grab_focus()
+
+    def _on_toggle(self, gesture, n_press, x, y, gidx):
+        rev, ind, _cnt, _total = self._sections[gidx]
+        now = rev.get_reveal_child()
+        rev.set_reveal_child(not now)
+        ind.set_label("▶" if now else "▼")
+
+    # ── tldr popup ────────────────────────────────────────────────────────────
+
+    def _on_cmd_click(self, gesture, n_press, x, y, cmd_text):
+        base_cmd = _extract_base_cmd(cmd_text)
+        if base_cmd:
+            self._show_tldr_popup(base_cmd)
+
+    def _show_tldr_popup(self, cmd_name):
+        self._dismiss_tldr_popup()
+
+        if cmd_name in self._tldr_cache:
+            success, raw = self._tldr_cache[cmd_name]
+        else:
+            success, raw = _run_tldr(cmd_name)
+            self._tldr_cache[cmd_name] = (success, raw)
+
+        C = self.C
+        popup = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        popup.add_css_class("tldr-popup")
+
+        if success:
+            title, desc, entries = _parse_tldr_raw(raw)
+
+            title_label = Gtk.Label(label=(title or cmd_name).upper())
+            title_label.add_css_class("tldr-title")
+            title_label.set_halign(Gtk.Align.START)
+            popup.append(title_label)
+
+            if desc:
+                desc_label = Gtk.Label(label=desc)
+                desc_label.add_css_class("tldr-desc")
+                desc_label.set_halign(Gtk.Align.START)
+                desc_label.set_wrap(True)
+                desc_label.set_xalign(0)
+                popup.append(desc_label)
+
+            sep = Gtk.Box()
+            sep.add_css_class("tldr-sep")
+            popup.append(sep)
+
+            for explanation, code in entries:
+                exp_label = Gtk.Label(label=explanation)
+                exp_label.add_css_class("tldr-explanation")
+                exp_label.set_halign(Gtk.Align.START)
+                exp_label.set_wrap(True)
+                exp_label.set_xalign(0)
+                popup.append(exp_label)
+
+                code_label = Gtk.Label(label=code)
+                code_label.add_css_class("tldr-code")
+                code_label.set_halign(Gtk.Align.START)
+                code_label.set_xalign(0)
+                code_label.set_selectable(True)
+                popup.append(code_label)
+
+            src = Gtk.Label(label=f"source: tldr {cmd_name}")
+            src.add_css_class("tldr-source")
+            src.set_halign(Gtk.Align.START)
+            popup.append(src)
+        else:
+            err = Gtk.Label(label=raw)
+            err.add_css_class("tldr-error")
+            err.set_halign(Gtk.Align.START)
+            popup.append(err)
+
+        hint = Gtk.Label(label="ESC or click outside to close")
+        hint.add_css_class("tldr-close-hint")
+        hint.set_halign(Gtk.Align.CENTER)
+        popup.append(hint)
+
+        backdrop = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        backdrop.add_css_class("tldr-overlay")
+        backdrop.set_halign(Gtk.Align.FILL)
+        backdrop.set_valign(Gtk.Align.FILL)
+        backdrop.set_hexpand(True)
+        backdrop.set_vexpand(True)
+
+        popup_scroll = Gtk.ScrolledWindow()
+        popup_scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        popup_scroll.set_max_content_height(600)
+        popup_scroll.set_propagate_natural_height(True)
+        popup_scroll.set_child(popup)
+        popup_scroll.set_halign(Gtk.Align.CENTER)
+        popup_scroll.set_valign(Gtk.Align.CENTER)
+
+        backdrop.append(Gtk.Box(vexpand=True))
+        backdrop.append(popup_scroll)
+        backdrop.append(Gtk.Box(vexpand=True))
+
+        backdrop_click = Gtk.GestureClick()
+        backdrop_click.connect("pressed", self._on_backdrop_click)
+        backdrop.add_controller(backdrop_click)
+
+        self._tldr_overlay = backdrop
+        self._overlay_parent.add_overlay(backdrop)
+
+    def _dismiss_tldr_popup(self):
+        if self._tldr_overlay is not None:
+            self._overlay_parent.remove_overlay(self._tldr_overlay)
+            self._tldr_overlay = None
+
+    def _on_backdrop_click(self, gesture, n_press, x, y):
+        self._dismiss_tldr_popup()
+
+    # ── Search ────────────────────────────────────────────────────────────────
+
+    def _on_search_changed(self, entry):
+        query = entry.get_text().strip().lower()
+        self._search_results_rev.set_reveal_child(False)
+
+        if not query:
+            self._reset_search()
+            return
+
+        section_visible = {}
+        for row, cmd, desc, example, sec_idx in self._cmd_rows:
+            visible = query in cmd or query in desc or query in example
+            row.set_visible(visible)
+            if sec_idx not in section_visible:
+                section_visible[sec_idx] = 0
+            if visible:
+                section_visible[sec_idx] += 1
+
+        for idx, (rev, ind, cnt, total) in enumerate(self._sections):
+            vis = section_visible.get(idx, 0)
+            if vis == total:
+                cnt.set_label(f"{total} cmds")
+            else:
+                cnt.set_label(f"{vis}/{total} cmds")
+
+    def _reset_search(self):
+        for row, _, _, _, _ in self._cmd_rows:
+            row.set_visible(True)
+        for idx, (rev, ind, cnt, total) in enumerate(self._sections):
+            cnt.set_label(f"{total} cmds")
+        self._search_results_rev.set_reveal_child(False)
+
+    def _on_search_activate(self, entry):
+        query = entry.get_text().strip()
+        if not query:
+            return
+        base = _extract_base_cmd(query)
+        if not base:
+            base = query.split()[0] if query.split() else query
+        self._show_tldr_popup(base)
+
+    # ── Keyboard ──────────────────────────────────────────────────────────────
+
+    def _is_search_focused(self):
+        if not self._search_entry:
+            return False
+        if self._search_entry.has_focus():
+            return True
+        child = self._search_entry.get_first_child()
+        while child:
+            if child.has_focus():
+                return True
+            child = child.get_next_sibling()
+        return False
+
+    def _on_key_capture(self, controller, keyval, keycode, state):
+        """CAPTURE phase — only ESC."""
+        if keyval != Gdk.KEY_Escape:
+            return False
+        if self._tldr_overlay is not None:
+            self._dismiss_tldr_popup()
+            return True
+        search_focused = self._is_search_focused()
+        has_query = search_focused and bool(self._search_entry.get_text().strip())
+        if has_query:
+            self._search_entry.set_text("")
+            self._reset_search()
+            self._focus_sink.grab_focus()
+            return True
+        if search_focused:
+            self._focus_sink.grab_focus()
+            return True
+        cleanup()
+        controller.get_widget().close()
+        return True
+
+    def _on_key(self, controller, keyval, keycode, state):
+        """BUBBLE phase — global shortcuts."""
+        if self._is_search_focused():
+            return False
+        if keyval == Gdk.KEY_e:
+            for r, i, _c, _t in self._sections:
+                r.set_reveal_child(True)
+                i.set_label("▼")
+            return True
+        if keyval == Gdk.KEY_c:
+            for r, i, _c, _t in self._sections:
+                r.set_reveal_child(False)
+                i.set_label("▶")
+            return True
+        if keyval == Gdk.KEY_slash:
+            if self._search_entry:
+                self._search_entry.grab_focus()
+                return True
+        return False
+
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="deskmat",
+        description="Wayland cheat sheet overlay with tldr integration",
+    )
+    parser.add_argument(
+        "-c", "--config",
+        help="Path to config YAML file (default: ~/.config/deskmat/config.yaml)",
+    )
+    parser.add_argument(
+        "-v", "--version",
+        action="version",
+        version=f"deskmat {__version__}",
+    )
+    args = parser.parse_args()
+
+    # Toggle: kill existing instance
+    if kill_existing():
+        sys.exit(0)
+
+    write_lockfile()
+    signal.signal(signal.SIGTERM, cleanup)
+    signal.signal(signal.SIGINT, cleanup)
+
+    colors, left, right, settings = load_config(args.config)
+
+    app = DeskmatApp(colors, left, right, settings)
+    app.run(None)
+
+
+if __name__ == "__main__":
+    main()
