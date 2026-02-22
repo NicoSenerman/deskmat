@@ -43,7 +43,7 @@ Install the equivalent packages. The key requirement is `gtk4-layer-shell` — t
 
 ```bash
 # Clone the repo
-git clone https://github.com/YOUR_USERNAME/deskmat.git
+git clone https://github.com/NicoSenerman/deskmat.git
 cd deskmat
 
 # Install to ~/.local/bin (or run the install script)
