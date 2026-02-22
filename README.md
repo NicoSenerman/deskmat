@@ -4,8 +4,16 @@ A fullscreen Wayland cheat sheet overlay for your desktop. Like a physical deskm
 
 Built with GTK4 + Layer Shell. Themed in Monokai Pro. Integrates with [tldr](https://github.com/tldr-pages/tldr) for deep-dive command lookups.
 
-<!-- TODO: Add screenshot here -->
-<!-- ![deskmat screenshot](screenshots/deskmat.png) -->
+![deskmat overview](screenshots/overview.png)
+
+### Click any command for its tldr page
+![tldr popup](screenshots/tldr-popup.png)
+
+### Live search with match counts per section
+![search filtering](screenshots/search-filter.png)
+
+### Look up any command via search + Enter
+![tldr via search](screenshots/tldr-search.png)
 
 ## Features
 
