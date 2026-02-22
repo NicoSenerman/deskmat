@@ -2,6 +2,8 @@
 
 A fullscreen Wayland cheat sheet overlay for your desktop. Like a physical deskmat, but interactive.
 
+> In an era where AI writes most of my code, I found myself forgetting basic commands — or never learning them in the first place. I built deskmat so I'd always have a reference one keybind away. Not to replace learning, but to support it. Every time I glance at a command instead of asking an LLM, it sticks a little more.
+
 Built with GTK4 + Layer Shell. Themed in Monokai Pro. Integrates with [tldr](https://github.com/tldr-pages/tldr) for deep-dive command lookups.
 
 ![deskmat overview](screenshots/overview.png)
