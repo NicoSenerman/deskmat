@@ -221,7 +221,7 @@ def _builtin_left(C):
             "sections": [
                 {
                     "title": "Navigation & Files",
-                    "expanded": True,
+                    "expanded": False,
                     "groups": [
                         ("Moving Around", [
                             ("cd dir", "Enter directory", "cd ~/Projects"),
@@ -434,6 +434,36 @@ def _builtin_left(C):
                             ("rsync -avz src/ host:dst/", "Efficient sync", "rsync -avz ./build/ prod:/var/www/"),
                             ("ssh-keygen -t ed25519", "Generate key", "ssh-keygen -t ed25519 -C 'me@host'"),
                             ("ssh-copy-id user@host", "Install key", "ssh-copy-id user@server"),
+                        ]),
+                    ],
+                },
+                {
+                    "title": "tmux (Remote Sessions)",
+                    "expanded": False,
+                    "groups": [
+                        ("Session Basics", [
+                            ("tmux", "Start new session", "ssh server && tmux"),
+                            ("tmux new -s name", "Named session", "tmux new -s project"),
+                            ("tmux attach", "Reattach session", "tmux attach || tmux"),
+                            ("tmux attach -t name", "Attach by name", "tmux attach -t project"),
+                            ("tmux ls", "List sessions", "tmux ls"),
+                            ("tmux kill-session -t name", "Kill session", "tmux kill-session -t project"),
+                        ]),
+                        ("Inside tmux", [
+                            ("Ctrl+b  d", "Detach (session stays)", ""),
+                            ("Ctrl+b  [", "Scroll mode (q to exit)", ""),
+                            ("Ctrl+b  c", "New window", ""),
+                            ("Ctrl+b  n / p", "Next / prev window", ""),
+                            ("Ctrl+b  %", "Split pane vertical", ""),
+                            ("Ctrl+b  \"", "Split pane horizontal", ""),
+                            ("exit / Ctrl+d", "Kill pane (ends session if last)", ""),
+                        ]),
+                        ("Config & Tips", [
+                            ("~/.tmux.conf", "Config file (on server)", ""),
+                            ("set -g mouse on", "Enable mouse scroll", "echo 'set -g mouse on' >> ~/.tmux.conf"),
+                            ("tmux source ~/.tmux.conf", "Reload config", ""),
+                            ("Shift + select", "Copy text (mouse on)", "Shift+click+drag, then Ctrl+Shift+C"),
+                            ("ssh -t host 'tmux a || tmux'", "SSH + auto-attach", "alias srv=\"ssh -t server 'tmux a || tmux'\""),
                         ]),
                     ],
                 },
